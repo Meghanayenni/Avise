@@ -216,15 +216,42 @@ Node types    Person · Phone · Account · Vehicle · Location ·
 Edge classes  RELATIONSHIP   link between entities
               IDENTITY       hypothesis or confirmed sameness
 
-Every edge carries
-  source_doc_id · source_span · extraction_method
-  confidence · first_seen_ts · last_seen_ts
-  edge_origin · alternative_explanations[]
+On the edge — interpretation: what the system concluded
+  edge_origin                non-nullable
+  confidence                 float [0,1]
+  confidence_basis           list of contributing reasons
+  first_seen_ts · last_seen_ts
+  alternative_explanations[]
+  inference_rule_id          set for system_inferred, else null
+  base_rate_context          nullable
 
-Inferred edges additionally carry
-  inference_rule_id · supporting_record_ids[]
-  contradicting_record_ids[] · base_rate_context
+On edge_provenance — attribution: where it came from
+  edge_id
+  document_id · record_id · mention_id    nullable as appropriate
+  locator                    SourceLocator (below)
+  role                       supporting | contradicting
+  extraction_method
+  created_at
 ```
+
+An edge may have many provenance rows. It cannot persist without at least one supporting row.
+
+**Supporting and contradicting records are derived, not stored.** `supporting_record_ids[]` and `contradicting_record_ids[]` are views over `edge_provenance` filtered by `role`. Storing them as columns would create a second source of truth for the same fact.
+
+**`extraction_method` lives on the provenance row, not the edge.** One edge may be supported by a regex match and a spaCy match; each carries its own method.
+
+### Source locator
+
+Character offsets are meaningful for narrative text and meaningless for a CDR or transaction row. Provenance therefore points at its source through a discriminated union:
+
+```
+SourceLocator =
+  text_span      document_id · char_start · char_end    FIR narratives, surveillance notes
+  record_field   record_id · field_name                 one field of a tabular record
+  record_row     record_id                              a whole tabular record
+```
+
+Stored as `locator_kind` plus nullable `char_start`, `char_end`, `field_name`, with a CHECK constraint enforcing the correct fields per kind. The same locator applies to `mentions` and to `edge_provenance`. "Open the source" highlights the span for `text_span`, and the row or field for the other two.
 
 ### Three origins
 
@@ -244,7 +271,7 @@ The third is not a note. It enters the graph and it enters analytics, because an
 
 `base_rate_context` records why an inference is non-trivial — for co-presence, the tower's background traffic. Six co-locations at a railway station means nothing; at a residential tower it means something. Without this field, the reasoning is not auditable.
 
-`contradicting_record_ids[]` exists because evidence against must be displayed. If it is not a field, it will not be shown.
+`role = contradicting` on provenance exists because evidence against must be displayed. If it is not in the schema, it will not be shown.
 
 ## 8. Annotation and assertion
 
@@ -273,6 +300,22 @@ Created by drawing a thread between two items on the board, which is the gesture
 ### Asserted entity
 
 A person, phone or vehicle that exists in no document but came up in an interview. Same origin.
+
+### Assertion schema
+
+```
+investigator_assertions
+  id · case_id
+  assertion_kind      relationship | entity
+  payload             edge or entity definition
+  basis               not null, at least 10 non-blank characters
+  author_id · created_at · edited_at
+  revoked_at · revoked_by
+  produced_edge_id · produced_entity_id    nullable
+  supersedes_id       previous version, nullable
+```
+
+Versions are kept by supersession: an edit that changes the claim writes a new row pointing at the old one, and the old row is revoked. Nothing is deleted. `edited_at` covers typo fixes that do not change meaning. The basis floor is enforced independently in the database CHECK and in the Pydantic model.
 
 ### The symmetry rule
 
@@ -376,17 +419,43 @@ The most important safeguard in the product is linguistic, and language requirem
 
 All system-generated user-facing text comes from one vocabulary module. No free-text string literals for claims anywhere in the codebase.
 
+The module is `avise/domain/vocabulary.py` — a pure contract with no I/O. The first twenty templates:
+
 ```
 CLAIM_TEMPLATES = {
-  "co_presence":        "Repeated co-presence observed between {a} and {b}",
-  "identity_candidate": "Possible identity match between {a} and {b}",
-  "burst_before":       "Communication burst recorded {h} hours before {event}",
-  "burner_continuity":  "Possible handset continuity between {a} and {b}",
-  "structural_role":    "Structural role: {role}",
-  "coverage_gap":       "No {source} data held for {entity} between {from} and {to}",
-  ...
+  # relationships
+  "observed_call":        "{a} called {b} on {date}",
+  "observed_transfer":    "{a} transferred {amount} to {b} on {date}",
+  "observed_mention":     "{a} and {b} are mentioned in the same record",
+  "co_presence":          "Repeated co-presence observed between {a} and {b}",
+  "handset_continuity":   "Possible handset continuity between {a} and {b}",
+  "shared_address":       "{a} and {b} are recorded at the same address",
+  "asserted_relationship":"{author} recorded a relationship between {a} and {b}",
+
+  # identity
+  "identity_candidate":   "Possible identity match between {a} and {b}",
+  "identity_confirmed":   "{author} confirmed {a} and {b} as the same person",
+  "identity_rejected":    "{author} recorded {a} and {b} as separate people",
+  "identity_pending":     "Identity match awaiting investigator review",
+
+  # structure
+  "structural_role":      "Structural role: {role}",
+  "centrality_rank":      "Ranked {rank} by {measure} in this component ({scenario})",
+  "component_split":      "Removing {entity} separates the network into {n} components",
+
+  # patterns
+  "burst_before":         "Communication burst recorded {hours} hours before {event}",
+  "circular_flow":        "Circular transfer observed across {n} accounts over {days} days",
+  "threshold_structuring":"Repeated transfers recorded below the reporting threshold",
+  "new_connection":       "Relationship first recorded within the last {days} days",
+
+  # absence and uncertainty
+  "coverage_gap":         "No {source} data held for {entity} between {from} and {to}",
+  "insufficient_evidence":"Available records are insufficient to resolve this question",
 }
 ```
+
+Every template describes what is recorded or measured. None describes a person.
 
 Plus a test that fails the build:
 
@@ -574,7 +643,7 @@ EvidenceDrawer {
   subject       { type, id, label }
   claim         controlled vocabulary
   origin        observed | inferred | asserted
-  supporting    EvidenceRef[]   each links to a source span
+  supporting    EvidenceRef[]   each carries a SourceLocator (§7)
   contradicting EvidenceRef[]
   unknown       string[]        what would help but is absent
   alternatives  string[]
@@ -844,6 +913,11 @@ Recorded with actor, timestamp, case, target and before/after state:
 - Every identity decision and every reversal
 - Every assertion, annotation and edit
 - Report generation and export
+- Every view of a `restricted` entity, by any member including the lead
+
+The full event enum is defined in Phase 0 (`docs/PHASE-0-DECISIONS.md` A6); later phases add emission sites, not migrations.
+
+**Sensitive reads are bounded.** Entering a case writes one `case.opened` row, not one row per entity fetched. Unbounded read auditing would make `audit_log` the largest table in the database and chain verification slow enough to matter. The exception is `restricted.viewed`, written on every view of a restricted entity.
 
 **Identity decisions matter most.** A merge changes what the system asserts about a person, so who decided, when, and on what evidence is part of the investigative record — not merely a system log.
 
@@ -983,7 +1057,7 @@ Microservices solve independent scaling and independent deployment. You have nei
 avise/
   api/          routes, request/response schemas
   core/         config, security, session, audit middleware
-  domain/       ontology models — the contract
+  domain/       ontology models, controlled vocabulary — the contract
   ingest/       source parsers, normalisation
   extract/      regex, gazetteers, spaCy pipeline
   identity/     candidate generation, scoring, hypothesis lifecycle
@@ -995,7 +1069,21 @@ avise/
   worker/       job loop
 ```
 
-Boundaries enforced by discipline: `api` may import anything; domain modules may import `domain` and `db` but not each other; nothing imports `api`. If a module later needs extracting, the seams are already correct.
+Boundaries are layered:
+
+```
+domain/      imports nothing internal
+core/        may import domain
+db/          may import domain, core
+processing/  ingest · extract · identity · graph · patterns · query
+             · report · storage
+             may import domain, core, db — not each other
+worker/      may import domain, core, db, processing
+api/         may import anything
+             NOTHING imports api
+```
+
+Enforced by a structural test walking each module's imports, not by discipline. If a module later needs extracting, the seams are already correct.
 
 **Background work without a broker.** Ingestion and extraction take seconds to minutes and must not block a request. Celery would require Redis — another service to install, run and explain. Instead: a `jobs` table and a single worker process from the same codebase, polling for queued work and writing progress back to the row. The UI polls the job. Zero extra infrastructure, and you get a visible processing panel for free.
 
@@ -1025,7 +1113,7 @@ GRAPH                  edges · edge_provenance
 
 IDENTITY RESOLUTION    identity_hypotheses · identity_decisions
 
-HUMAN CONTENT          annotations · assertions
+HUMAN CONTENT          annotations · investigator_assertions
 
 ANALYSIS               findings · leads · analytics_runs
 
@@ -1041,7 +1129,7 @@ Every table holding case content carries an indexed `case_id`, and no repository
 ```
 Upload → document row (path, sha256, source_type, uploaded_by)
        → job queued
-       → adapter parses → records (typed, normalised, with source spans)
+       → adapter parses → records (typed, normalised, with source locators)
        → records stored, extraction job queued
 ```
 
@@ -1061,7 +1149,7 @@ The guiding principle: use the cheapest method that produces an explainable resu
 
 *Honest limitation:* off-the-shelf English NER has mediocre recall on Indian personal names in police-report prose. This is the weakest link. Mitigations: a gazetteer of common given names and surnames to boost candidates, and the fact that Tier 1 captures the high-value identifiers independently, so NER failure degrades the graph rather than breaking it.
 
-**Tier 3, benchmark before adopting.** GLiNER-small (🟡 ~1 GB, CPU-workable) for custom types. Run it against spaCy on a holdout split in Phase 2 and pick with numbers, not reputation.
+**No third tier.** GLiNER was considered and removed: it requires `torch`, a multi-gigabyte dependency for a marginal NER gain on synthetic data we control. spaCy `en_core_web_md` plus gazetteers is the extraction path.
 
 Not recommended: `en_core_web_trf` (🟠 ~2 GB with torch, slow, marginal gain). Fine-tuning (🔴 no GPU, no corpus).
 
@@ -1167,34 +1255,39 @@ Provenance is a schema property, not a display feature. Nothing enters the graph
 
 ```
 mentions
-  id · document_id · record_id · char_start · char_end
+  id · document_id · record_id
+  locator_kind · char_start · char_end · field_name
   surface_text · mention_type · extraction_method · confidence
 
 entities
   id · case_id · entity_type · canonical_form · created_from_mention_id
+  restricted boolean not null default false
 
 edges
   id · case_id · source_entity_id · target_entity_id · edge_type
   edge_origin ∈ {system_observed, system_inferred, investigator_asserted}
-  confidence · first_seen_ts · last_seen_ts
-  alternative_explanations[]
+  confidence · confidence_basis · first_seen_ts · last_seen_ts
+  alternative_explanations[] · inference_rule_id · base_rate_context
 
 edge_provenance
-  edge_id · document_id · record_id · char_start · char_end
+  edge_id · document_id · record_id · mention_id
+  locator_kind · char_start · char_end · field_name
   role ∈ {supporting, contradicting}
-  inference_rule_id · base_rate_context
+  extraction_method · created_at
 ```
+
+`locator_kind ∈ {text_span, record_field, record_row}`, with a CHECK constraint enforcing the fields each kind requires (§7).
 
 | Question | Answered by |
 |---|---|
 | Where did this come from? | `edge_provenance → documents` |
 | Which source produced it? | `document.source_type`, `document.sha256` |
-| What part of the source supports it? | `char_start`, `char_end` — rendered as a highlight in the original |
+| What part of the source supports it? | The source locator — a character span highlighted in narrative text, or the row and field in a tabular record |
 | Observed, inferred or asserted? | `edge_origin` |
 | What confidence, and why? | `confidence` plus stored feature contributions |
 | Who confirmed or rejected it? | `identity_decisions`, with `evidence_snapshot` |
 
-**The character offsets are what make this real rather than decorative.** Clicking evidence opens the source document with the exact span highlighted. Storing offsets costs two integers; retrofitting them costs re-extracting everything.
+**The locator is what makes this real rather than decorative.** Clicking evidence opens the source with the exact span, row or field highlighted. Storing a locator costs a few columns; retrofitting one costs re-extracting everything.
 
 ## 36. Security
 
@@ -1250,10 +1343,10 @@ Prerequisites
 
 One-time
   docker compose up -d db
-  python -m venv .venv && pip install -r requirements.txt
+  py -3.11 -m venv .venv && pip install -r requirements.txt
   python -m spacy download en_core_web_md
   alembic upgrade head
-  python -m avise.seed          synthetic data + demo accounts
+  python -m tools.seed          synthetic data + demo accounts
   cd web && npm install
 
 Running — three terminals
@@ -1264,7 +1357,9 @@ Running — three terminals
 
 **Docker for Postgres only.** Containerising the Python app adds rebuild friction and Docker Desktop already costs around a gigabyte on Windows. Postgres in a container makes every teammate's database identical, removing a class of "works on my machine" problem.
 
-**Seed and reset must be one command.** You will run it dozens of times, and on demo day it is your recovery path.
+On Windows, use `py -3.11` explicitly — a bare `python` may resolve to an older interpreter.
+
+**Seed and reset must be one command.** You will run it dozens of times, and on demo day it is your recovery path. `make` is not required: the dev, test, seed, reset and lint tasks exist as `scripts/*.ps1`, with a `Makefile` for parity on Unix.
 
 **Deployment.** For SIH, do not deploy. Run locally and demonstrate offline operation deliberately. If you want a backup, one small VM running the same three processes behind nginx suffices. Kubernetes and managed services are 🔴.
 
@@ -1317,20 +1412,30 @@ Public data is used only for realism scaffolding — Indian district and station
 
 ## 41. Synthetic dataset
 
-**Scenario:** an inter-district narcotics distribution network with hawala-style financing, spanning Chennai and Coimbatore, over a six-month window.
+**Scenario:** an inter-district narcotics distribution network with hawala-style financing, spanning two districts — Chennai and Coimbatore — and three police stations, over a six-month window.
 
-Chosen because it naturally produces all four data types, involves both communication and money, and gives a plausible reason for two apparently unrelated case clusters to share a hidden intermediary.
+Chosen because it naturally produces every data type, involves both communication and money, and gives a plausible reason for two apparently unrelated case clusters to share a hidden intermediary.
 
 ### Volumes
+
+These volumes describe the **demo** set. The holdout set is generated separately (see Generation).
 
 | Source | Volume | Rationale |
 |---|---|---|
 | FIRs | 40 documents, 200–600 words | Enough for NER to look real, small enough to hand-check |
-| CDR | ~8,000 rows, 30 numbers, 6 months | Enough for burner and co-presence patterns to be statistically visible |
+| CDR | ~8,000 rows, 30 structure numbers plus ~120 background numbers, 6 months | Enough for burner and co-presence patterns to be statistically visible |
+| Towers | ~25 towers | Location and area type, so base rates are computed rather than asserted |
 | Transactions | ~1,200 rows, 18 accounts | Enough for cycles and structuring to emerge |
 | Surveillance notes | 25 short narratives | The unstructured source where name variants live |
-| Criminal records | 60 person records | Identity attributes for resolution |
+| Prior records | 60 person records | Identity attributes for resolution |
+| Vehicle registry | ~40 rows | Registered ownership, so structure 6 is discoverable |
 | Total graph | ~2,500 nodes, ~9,000 edges | Comfortable for NetworkX, non-trivial to eyeball |
+
+**Why "prior records".** The source type is `prior_records`, labelled "Prior records". "Criminal records" as a source label asserts something about the people in it; "prior records" is accurate and neutral.
+
+**Background traffic.** The ~120 background numbers belong to no planted structure. They produce ordinary call traffic weighted toward commercial and transit towers. The co-presence base rate is computed from the CDR itself — unique devices per tower per hour — and the decoy's high degree comes from genuine background contact rather than hand-placed edges.
+
+**Graph size.** ~2,500 nodes is reached by counting each call, transaction and incident as an Event node, alongside Person, Phone, Account, Vehicle, Location, Organisation, Handset and Document nodes. It is an expectation, not a target: the dataset is never padded to hit it.
 
 ### Schema
 
@@ -1348,8 +1453,14 @@ Transaction:    txn_id, from_account, to_account, amount, ts,
 
 Surveillance:   note_id, officer_id, date, location, narrative_text
 
-CriminalRecord: person_id, name, aliases[], dob, address,
+PriorRecord:    person_id, name, aliases[], dob, address,
                 prior_cases[], known_associates_text
+
+VehicleRegistry: registration_number, owner_name, owner_address,
+                registered_on, vehicle_class
+
+Tower:          tower_id, lat, lon,
+                area_type ∈ {residential, commercial, transit}
 ```
 
 ### Realism details
@@ -1361,6 +1472,8 @@ Indian phone numbers start 6–9 and are 10 digits. Vehicle registrations follow
 Fixed random seed. Emit both the data files and a `ground_truth.json` listing every planted structure, every true identity mapping, and every intended negative case.
 
 Split into `demo/` (used live, tuned for narrative clarity) and `holdout/` (never examined during development, used only for final evaluation numbers). This gives you an honest answer when a judge asks whether you tuned on your test set.
+
+The holdout is an independent generation at roughly 40% of demo volume, with its own nine planted structures built from entirely different entities. It is neither a duplicate nor a subset of demo.
 
 ## 42. Planted structures
 
@@ -1386,19 +1499,24 @@ These are what AVISE must discover. Written down before generating, so they doub
 
 ## 43. Phases
 
+Eight phases. The detailed roadmap — build lists, tests and verification per phase — is `docs/PHASES.md`.
+
 | Phase | Objective | Done when |
 |---|---|---|
-| 0 | Ontology, contracts, visual identity, synthetic generator with ground truth | Two people describe every node type, edge type and provenance field identically |
-| 1 | Vertical slice: upload → regex extraction → graph → board → evidence drawer | You click a node and see the source line it came from |
+| 0 | Contracts, access spine, synthetic data: ontology, vocabulary, visual tokens, users, sessions, cases, membership, case-scoping dependency, audit chain, generator with ground truth | The ontology is frozen, the access ladder is enforced by one dependency, the audit chain verifies, and the dataset regenerates deterministically |
+| 1 | Vertical slice: upload → regex extraction → graph → evidence drawer | You click a node and see the source it came from |
 | 2 | spaCy extraction, identity hypotheses, review queue, evaluation harness | You can state resolution precision and recall on a holdout split |
-| 3 | Graph intelligence, scenarios, resolution prioritisation, fragility | The planted broker surfaces without being searched for |
+| 3 | Graph analytics, scenarios, resolution prioritisation, fragility | The planted broker surfaces without being searched for |
 | 4 | Timeline, map, pattern rules, anomaly scoring | Every finding renders with its full evidence chain |
-| 5 | Annotation and assertion layer, auth, membership, audit, query layer, report | Removing a member takes effect on their next request, and the audit shows it |
-| 6 | Hardening, evaluation report, rehearsal, deck | Two clean end-to-end runs with the network cable pulled |
+| 5 | Annotation and assertion layer; security screens, invitations, team management and audit view on the Phase 0 spine | Removing a member takes effect on their next request, and the audit shows it |
+| 6 | Constrained query layer and investigation reports | No brief statement exists without a citation |
+| 7 | Hardening, evaluation report, rehearsal, deck | Two clean end-to-end runs with the network cable pulled |
+
+**Why the access spine is in Phase 0.** Every endpoint from Phase 1 onward must be case-scoped and audited; building routes first would mean retrofitting both into each one, and missing some. Only the security *screens* wait for Phase 5.
 
 **One tagged demoable build maintained throughout.** The frontend builds against mock JSON from Phase 0 and never waits on the backend.
 
-**What the first working prototype looks like (end of Phase 1):** upload a CDR CSV and an FIR text file; regex pulls phone numbers, vehicle numbers and dates; a graph appears with person and phone nodes, `called` and `mentioned_in` edges; clicking a node shows the source document with the extracted span highlighted. Inaccurate and unstyled, and already more than many teams have in week three.
+**What the first working prototype looks like (end of Phase 1):** upload a CDR CSV and an FIR text file; regex pulls phone numbers, vehicle numbers and dates; a graph appears with person and phone nodes and `called`, `transferred_to` and `mentioned_in` edges; clicking a node shows the source with the extracted span or record highlighted. Inaccurate and unstyled, and already more than many teams have in week three.
 
 ### Order of work
 
@@ -1406,27 +1524,28 @@ These are what AVISE must discover. Written down before generating, so they doub
 |---|---|---|
 | 1 | Ontology, API contract, mock JSON fixtures | Whole team, together |
 | 2 | Synthetic generator + ground truth | Data |
-| 3 | Postgres schema + migrations | Backend |
-| 4 | Ingest + regex extraction + graph build | Backend |
+| 3 | Postgres schema + migrations, including access tables | Backend |
+| 4 | Sessions, membership resolver, case-scoping dependency, audit chain | Backend |
 | 5 | UI shell against mock JSON | Frontend, in parallel from step 1 |
-| 6 | Wire UI to real API — **first demoable build, tag it** | Both |
-| 7 | spaCy NER | Backend |
-| 8 | Identity hypotheses + evaluation harness | Backend, allow generous time |
-| 9 | Question queue UI | Frontend |
-| 10 | Graph analytics, scenarios, role classification | Third / backend |
-| 11 | Pattern rules | Third / backend |
-| 12 | Timeline, map, money flow | Frontend |
-| 13 | Fragility simulation | Either |
-| 14 | Auth, membership, audit | Backend |
+| 6 | Ingest + regex extraction + graph build | Backend |
+| 7 | Wire UI to real API — **first demoable build, tag it** | Both |
+| 8 | spaCy NER | Backend |
+| 9 | Identity hypotheses + evaluation harness | Backend, allow generous time |
+| 10 | Question queue UI | Frontend |
+| 11 | Graph analytics, scenarios, role classification | Third / backend |
+| 12 | Pattern rules | Third / backend |
+| 13 | Timeline, map, money flow | Frontend |
+| 14 | Fragility simulation | Either |
 | 15 | Annotation and assertion layer | Both |
-| 16 | Templated brief; optional query layer | Either |
-| 17 | Hardening, evaluation report, deck, rehearsals | Whole team |
+| 16 | Security screens, invitations, team management, audit view | Both |
+| 17 | Templated brief; optional query layer | Either |
+| 18 | Hardening, evaluation report, deck, rehearsals | Whole team |
 
 ## 44. The demo
 
 Eight minutes. Shape: fragmented data → automated processing → hidden connection revealed → reasoning shown → operational recommendation.
 
-**Beat 0 — Setup (30s).** A case dashboard listing five FIRs from three districts. *"Five separate FIRs, three stations, four months. On paper, unrelated."* Then, on camera, unplug the network cable. *"Everything from here runs locally."*
+**Beat 0 — Setup (30s).** A case dashboard listing five FIRs from three stations across two districts. *"Five separate FIRs, three stations, four months. On paper, unrelated."* Then, on camera, unplug the network cable. *"Everything from here runs locally."*
 
 **Beat 1 — Ingestion (60s).** Upload FIRs, CDR, transactions. Live processing panel: documents parsed, mentions by type, entities created. Show one FIR beside its highlighted extractions. *"Every extracted entity points back to the exact span it came from."*
 
@@ -1501,19 +1620,38 @@ One more: **a team that cannot explain its own system.** If a judge asks how ide
 
 ## 47. Phase 0 checklist
 
-Nothing else starts until these exist and two people describe them identically.
+Nothing else starts until these exist and two people describe them identically. Mirrors Phase 0 in `docs/PHASES.md`; binding rulings are in `docs/PHASE-0-DECISIONS.md`.
 
-- [ ] Ontology: node types, edge classes, three origins, all provenance fields
+**Repository and tooling**
+- [ ] Module structure and layered import boundaries, with a structural test
+- [ ] PostgreSQL 16 via Docker Compose; Alembic wired to an initial revision
+- [ ] FastAPI skeleton with `/api/health`, structured error envelope, CORS locked to the dev origin
+- [ ] Vite + React + TypeScript + Tailwind skeleton with routing shell
+- [ ] Dev, test, seed, reset and lint scripts (`scripts/*.ps1`, plus a `Makefile`)
+
+**Ontology and contracts**
+- [ ] Ontology: node types, edge classes, three origins, edge fields, provenance fields, `SourceLocator`
 - [ ] Identity state machine and decision record schema
 - [ ] Annotation and assertion schema, with the mandatory basis field
 - [ ] Content origin taxonomy
-- [ ] Access tables: users, capabilities, sessions, cases, members, invitations
-- [ ] Controlled vocabulary module, first 20 templates, banned-phrase test
+- [ ] Controlled vocabulary module in `domain/`, twenty templates, banned-phrase test
 - [ ] Coverage declaration schema
 - [ ] Evidence drawer contract
-- [ ] Visual identity: tokens applied to a card, a node, and each thread type
-- [ ] Mock JSON fixtures for all eight workspace sections
-- [ ] Synthetic generator with ground truth, including structures 7, 8 and 9
+- [ ] TypeScript mirrors of every domain model; mock JSON fixtures for all eight workspace sections
+- [ ] Visual identity: `TokenSheet.tsx` rendering the four thread types, three card variants and palette
+
+**Access spine** *(no user-facing screens)*
+- [ ] Access tables: users, capabilities, sessions, cases, members, invitations, audit log, jobs
+- [ ] Argon2id hashing, server-side sessions, login rate limiting and lockout
+- [ ] `get_case_context` enforcing 401 / 404 / 403, and a repository that refuses queries without `case_id`
+- [ ] Case creation writes the lead membership in the same transaction
+- [ ] Full audit event enum; hash-chained append-only audit log with a verification utility
+
+**Synthetic data**
+- [ ] Generator with fixed seed and `ground_truth.json`, all nine structures including 7, 8 and 9
+- [ ] Prior records, vehicle registry, towers and background traffic
+- [ ] Independent `demo/` and `holdout/` generations sharing no entities
+- [ ] SVG composite-sketch portraits; seed script with demo accounts, one open case, one non-member
 
 ## 48. Decision log
 
@@ -1540,6 +1678,13 @@ Reversals and rejections made during design, recorded so they are not relitigate
 | JWT authentication | **Rejected** | Cannot revoke mid-life; removal must take effect immediately. |
 | Microservices | **Rejected** | No scaling problem; high cost for a three-person team. |
 | Reusing another project's skeleton | **Rejected** | AVISE has its own identity, conventions and visual language. |
+| Access spine in Phase 5 | **Moved to Phase 0** | Every endpoint must be case-scoped and audited from the first; retrofitting both misses some. Screens stay in Phase 5. |
+| Character offsets on every provenance row | **Replaced** | A `SourceLocator` union — text span, record field, record row. Offsets are meaningless for tabular data. |
+| `supporting_record_ids[]` as columns | **Derived** | Views over `edge_provenance` by role. Columns would be a second source of truth. |
+| "Criminal records" source type | **Renamed** | `prior_records`. A source label must not assert something about the people in it. |
+| GLiNER NER benchmark | **Removed** | Requires `torch`; marginal gain on synthetic data we control. |
+| Per-entity read auditing | **Bounded** | One `case.opened` row per case entry; `restricted.viewed` on every restricted-entity view. |
+| Required `make` | **Dropped** | PowerShell scripts plus a `Makefile` for parity; the team develops on Windows. |
 
 ---
 

@@ -14,7 +14,9 @@ A case-centric investigation workspace that turns fragmented evidence into an ex
 
 ## Source of truth
 
-`docs/AVISE-report.md` is the agreed specification. `docs/PHASES.md` is the eight-phase implementation roadmap.
+`docs/PHASE-0-DECISIONS.md` holds binding rulings. `docs/AVISE-report.md` is the agreed specification. `docs/PHASES.md` is the eight-phase implementation roadmap.
+
+Precedence: **PHASE-0-DECISIONS.md → AVISE-report.md → PHASES.md → CLAUDE.md**. Where a higher document settles a contradiction, the lower one is corrected, not left standing.
 
 The access spine — user, session, case, membership, case-scoping dependency and audit foundation — is built in **Phase 0**, before any feature endpoint exists. Security *screens* come in Phase 5. Never add a route that is not case-scoped and audited.
 
@@ -28,7 +30,7 @@ These are enforced in code, not documentation. A change that breaks any of them 
 
 1. **No silent identity merges.** No code path merges two person entities without an `identity_decisions` row naming a human. Merges are overlay records; underlying entities are never mutated or deleted.
 
-2. **Every edge carries provenance.** An edge without a `edge_provenance` row fails validation. Character offsets (`char_start`, `char_end`) are required on every mention.
+2. **Every edge carries provenance.** An edge without a supporting `edge_provenance` row fails validation. Every mention and every provenance row carries a `SourceLocator` — `text_span` (`char_start`, `char_end`), `record_field` or `record_row` — and never fabricated offsets on tabular data.
 
 3. **`edge_origin` is non-nullable** and one of `system_observed`, `system_inferred`, `investigator_asserted`. Serialisers may not omit it.
 
@@ -40,7 +42,7 @@ These are enforced in code, not documentation. A change that breaks any of them 
 
 7. **Every sensitive read and every decision writes an audit row.** Append-only, hash-chained.
 
-8. **No conclusory language.** All system-generated user-facing text comes from `avise/core/vocabulary.py`. The banned-phrase test must pass.
+8. **No conclusory language.** All system-generated user-facing text comes from `avise/domain/vocabulary.py`. The banned-phrase test must pass.
 
 9. **Investigator assertions require a stated basis.** An assertion without one is rejected at the API boundary.
 
@@ -55,8 +57,8 @@ These are enforced in code, not documentation. A change that breaks any of them 
 ```
 avise/
   api/        routes, request/response schemas
-  core/       config, security, session, audit, vocabulary
-  domain/     ontology models — the contract
+  core/       config, security, session, audit, rate limiting
+  domain/     ontology models, vocabulary.py — the contract
   ingest/     source adapters, normalisation
   extract/    regex, gazetteers, spaCy
   identity/   candidate generation, scoring, hypothesis lifecycle
@@ -69,7 +71,21 @@ avise/
 web/          React + TypeScript frontend
 ```
 
-**Import direction:** `api` may import anything. Domain modules may import `domain` and `db`, never each other. Nothing imports `api`.
+**Import direction — layered:**
+
+```
+domain/      imports nothing internal
+core/        may import domain
+db/          may import domain, core
+processing/  ingest · extract · identity · graph · patterns · query
+             · report · storage
+             may import domain, core, db — not each other
+worker/      may import domain, core, db, processing
+api/         may import anything
+             NOTHING imports api
+```
+
+`vocabulary.py` lives in `domain/` because it is a pure contract with no I/O. Enforced by `tests/structural/test_import_boundaries.py`.
 
 ### Data
 
@@ -92,6 +108,10 @@ web/          React + TypeScript frontend
 Python 3.11 · FastAPI · Pydantic v2 · SQLAlchemy 2 · Alembic · PostgreSQL 16 · NetworkX · spaCy `en_core_web_md` · rapidfuzz · jellyfish · scikit-learn · pandas · argon2-cffi · pytest
 
 React 18 · Vite · TypeScript · Tailwind · TanStack Query · Zustand · Cytoscape.js · Leaflet · Recharts
+
+Approved implementation dependencies and their phase timing are listed in `docs/PHASE-0-DECISIONS.md` §D. Do not install a deferred dependency before its phase.
+
+Use `py -3.11` on Windows; bare `python` resolves to 3.10 on the development machine.
 
 **Do not add a dependency without asking.** Specifically banned: any graph database, any vector database, Elasticsearch, Celery, Redis, Kafka, S3/MinIO, sentence-transformers, torch, any GNN library.
 
@@ -139,7 +159,7 @@ PLAN → IMPLEMENT → INTEGRATE → TEST → DEBUG → REVIEW → VERIFY → CO
 - [ ] Full test suite passes
 - [ ] Banned-phrase test passes
 - [ ] `alembic upgrade head` works from an empty database
-- [ ] Seed script runs clean
+- [ ] Dev, test, seed and reset scripts run clean (`scripts/*.ps1`; `make` is not required)
 - [ ] No TypeScript errors (`npm run typecheck`)
 - [ ] No browser console errors or warnings
 - [ ] No unhandled backend exceptions in logs

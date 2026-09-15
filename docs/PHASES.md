@@ -4,6 +4,8 @@ Eight phases. Work them in order. Read `CLAUDE.md` before every session.
 
 Reference the specification by section: `docs/AVISE-report.md`.
 
+Precedence: `docs/PHASE-0-DECISIONS.md` → `docs/AVISE-report.md` → `docs/PHASES.md` → `CLAUDE.md`.
+
 ---
 
 ## Phase map
@@ -33,15 +35,17 @@ Phases 0 and 1 are strictly sequential. Nothing else starts until the ontology i
 
 ## 0A — Repository and tooling
 
-- Module structure exactly as in `CLAUDE.md`
-- `.gitignore`, `README.md`, `CLAUDE.md`, `docs/AVISE-report.md`, `docs/PHASES.md`
+- Module structure and layered import boundaries exactly as in `CLAUDE.md`
+- `.gitignore`, `README.md` (records the `py -3.11` interpreter)
 - `docker-compose.yml` for PostgreSQL 16 only
-- `pyproject.toml` or `requirements.txt`, virtual environment
-- FastAPI skeleton with `/health`, structured error envelope, CORS locked to the dev origin
+- `pyproject.toml` or `requirements.txt`, virtual environment on Python 3.11
+- FastAPI skeleton with `/api/health`, structured error envelope, CORS locked to the dev origin
 - Vite + React + TypeScript + Tailwind skeleton, routing shell, design tokens from report §18
+- `web/src/theme/TokenSheet.tsx` — one static, unrouted component rendering the four thread types, three card variants and palette swatches
 - Alembic wired to an initial revision
 - `pytest.ini`, `conftest.py`, test-database fixture
-- Scripts: `dev`, `test`, `seed`, `reset`
+- Scripts: `scripts/dev.ps1`, `test.ps1`, `seed.ps1`, `reset.ps1`, `lint.ps1`, plus a `Makefile` for parity on Unix. `make` is not required.
+- Dependencies limited to the approved Phase 0 list in `PHASE-0-DECISIONS.md` §D
 
 ## 0B — Ontology and contracts
 
@@ -49,15 +53,19 @@ Phases 0 and 1 are strictly sequential. Nothing else starts until the ontology i
   - Node types: Person, Phone, Account, Vehicle, Location, Organisation, Event, Document, Handset, Photo
   - Edge classes: RELATIONSHIP, IDENTITY
   - `edge_origin ∈ {system_observed, system_inferred, investigator_asserted}` — non-nullable
-  - Provenance fields: `source_doc_id`, `char_start`, `char_end`, `extraction_method`, `confidence`, `first_seen_ts`, `last_seen_ts`
-  - `alternative_explanations[]`, `inference_rule_id`, `base_rate_context`, `contradicting_record_ids[]`
+  - On the edge: `edge_origin`, `confidence`, `confidence_basis`, `first_seen_ts`, `last_seen_ts`, `alternative_explanations[]`, `inference_rule_id`, `base_rate_context`
+  - On `edge_provenance`: `edge_id`, `document_id`, `record_id`, `mention_id`, locator, `role ∈ {supporting, contradicting}`, `extraction_method`, `created_at`
+  - Supporting and contradicting record ids are derived views over `edge_provenance`, never columns
+  - `SourceLocator` discriminated union — `text_span`, `record_field`, `record_row` — on both `mentions` and `edge_provenance`, with a per-kind CHECK constraint (report §7)
+  - `entities.restricted boolean not null default false` — column only, no gating
 - Identity state machine: `PROPOSED`, `CONFIRMED`, `REJECTED`, `NEEDS_EVIDENCE`, `DEFERRED`
 - `identity_decisions` schema with `evidence_snapshot`, `rationale_text`, `superseded_by`
-- Annotation and assertion schemas, with the **mandatory basis field**
+- Annotation schema, and `investigator_assertions` schema with the **mandatory basis field** enforced in both Pydantic and a database CHECK (report §8)
 - Content origin taxonomy (report §9)
-- `case_data_coverage` schema (report §13)
+- `case_data_coverage` schema (report §10)
+- Source-type enum: `fir`, `cdr`, `transaction`, `surveillance_note`, `prior_record`, `vehicle_registry`, `tower`
 - Evidence drawer response contract (report §17)
-- `avise/core/vocabulary.py` — first 20 claim templates (report §12)
+- `avise/domain/vocabulary.py` — the twenty claim templates (report §12)
 - `web/src/types/` — TypeScript mirrors of every domain model
 - `web/src/mocks/` — JSON fixtures for all eight workspace sections
 
@@ -67,7 +75,9 @@ Phases 0 and 1 are strictly sequential. Nothing else starts until the ontology i
 
 ```
 users                  id · service_id · full_name · designation · email
-                       password_hash · status(pending|active|suspended|deactivated)
+                       password_hash
+                       status(pending_verification|active|suspended|deactivated)
+                       failed_login_count · locked_until
                        created_by · created_at · last_login_at
 
 account_capabilities   user_id · capability · granted_by · granted_at · revoked_at
@@ -97,9 +107,28 @@ jobs                   id · case_id · kind · status · progress · error · t
 - Argon2id password hashing (`argon2-cffi`)
 - Registration endpoint → `status = pending_verification`
 - Activation endpoint, gated on `user:provision`
-- Login / logout endpoints, server-side session rows
+- Login / logout endpoints, server-side session rows; session tokens stored as SHA-256 only
 - Cookie: httpOnly, Secure, SameSite=Lax, 8h sliding renewal
-- Rate limiting on login; identical responses for wrong password and unknown account; lockout after repeated failures
+- Identical responses for wrong password and unknown account
+- Account lockout: 5 failures within 15 minutes locks for 15 minutes, stored on `users`
+- IP rate limit: 10 login attempts per minute, in-process sliding window (`core/ratelimit.py`)
+
+**Permitted routes** — the only routes Phase 0 builds
+
+```
+GET    /api/health
+POST   /api/auth/register
+POST   /api/auth/activate/{user_id}      requires user:provision
+POST   /api/auth/login
+POST   /api/auth/logout
+GET    /api/auth/me                      id, service_id, full_name, designation, status
+POST   /api/cases                        requires case:create; writes lead membership
+GET    /api/cases                        active memberships only
+GET    /api/cases/{case_id}              via get_case_context; audits case.opened
+POST   /api/cases/{case_id}/close        lead-only; exists to route-test the 403 rung
+```
+
+Membership grant and revoke are **service-level functions** in Phase 0, used by the seed script and tests. Their routes and UI are Phase 5.
 
 **Authorization primitives**
 
@@ -122,8 +151,10 @@ jobs                   id · case_id · kind · status · progress · error · t
 **Audit foundation**
 
 - Middleware wrapping every sensitive read and every write
-- Append-only table; `row_hash = H(prev_hash ‖ row payload)`
-- Event schema covering: sign-in, sign-out, failed sign-in, lockout, account creation, activation, capability change, case creation, membership grant and revoke, identity decision and reversal, annotation, assertion, report generation, export
+- Sensitive read in Phase 0 means entering a case: one `case.opened` row, not one per entity fetched
+- Append-only table, one global chain with a `case_id` column; `row_hash = H(prev_hash ‖ row payload)`
+- The **complete** event enum from `PHASE-0-DECISIONS.md` A6 is defined now; later phases add emission sites, not migrations
+- Phase 0 emits: `auth.register`, `auth.activate`, `auth.login`, `auth.login_failed`, `auth.lockout`, `auth.logout`, `account.capability_granted`, `account.capability_revoked`, `case.created`, `case.opened`, `case.closed`, `membership.granted`, `membership.revoked`
 - Chain-verification utility exposed to tests
 
 **Explicitly NOT in Phase 0:** login and registration screens, invitation flow and UI, revocation UI, team management screen, audit viewer. Those are Phase 5.
@@ -131,18 +162,23 @@ jobs                   id · case_id · kind · status · progress · error · t
 ## 0D — Synthetic data and ground truth
 
 - `tools/generate_data.py`, fixed seed
-- Volumes per report §41: 40 FIRs, ~8,000 CDR rows, ~1,200 transactions, 25 surveillance notes, 60 criminal records
+- Demo volumes per report §41: 40 FIRs, ~8,000 CDR rows, ~1,200 transactions, 25 surveillance notes, 60 prior records, ~40 vehicle registry rows, ~25 towers
+- Two districts (Chennai, Coimbatore), three stations
+- ~120 background numbers outside every planted structure, traffic weighted toward commercial and transit towers; co-presence base rate derivable from the CDR itself
 - Indian realism: 10-digit numbers starting 6–9, `TN 09 BX 1234` registrations, IFSC format, FIR numbering, transliteration variance in names
 - All nine planted structures from report §42, **including the three negative cases**: the decoy, the benign coincidence, and the name collision that must not be merged
 - `ground_truth.json` — every planted structure, every true identity mapping, every intended negative case
-- `demo/` and `holdout/` split, sharing no entities
-- Composite-sketch style portrait assets, procedurally varied, clearly synthetic
-- `tools/seed.py` — demo accounts, one open case, one non-member account
+- `demo/` and `holdout/` as independent generations: holdout at ~40% of demo volume, its own nine structures, sharing no entities. Never examined during development.
+- Composite-sketch style portraits as procedurally varied **SVG**, clearly synthetic
+- `tools/seed.py`, invoked `python -m tools.seed` — demo accounts, one open case, one non-member account
 
 ## Tests
 
-- Banned-phrase test over `vocabulary.py`, report templates and `web/src` string tables
+- Banned-phrase test over `avise/domain/vocabulary.py`, report templates and `web/src` string tables — no allow-list
+- Import boundaries: `tests/structural/test_import_boundaries.py` walks each module's AST
 - Domain model round-trip: serialise → deserialise → equal
+- `SourceLocator` rejects fields belonging to another kind, in Pydantic and in the database CHECK
+- An assertion with a missing or too-short basis is rejected by Pydantic and by the database independently
 - Every mock fixture validates against its Pydantic schema
 - `alembic upgrade head` from an empty database
 - Register → pending account cannot reach any case
@@ -162,7 +198,7 @@ Standard checklist in `CLAUDE.md`. Additionally: grep the codebase and confirm n
 
 ## Definition of done
 
-`make dev` starts API and frontend. `make test` passes. The ontology is frozen. The access ladder is enforced by one dependency. The audit chain verifies. The dataset regenerates deterministically and `ground_truth.json` enumerates all nine structures.
+The dev, test, seed and reset scripts run: dev starts API and frontend, test passes. The ontology is frozen. The access ladder is enforced by one dependency. The audit chain verifies. The dataset regenerates deterministically and `ground_truth.json` enumerates all nine structures.
 
 **Commit.** `Phase 0: Contracts, access spine, synthetic data` · tag `phase-0`
 
@@ -189,11 +225,11 @@ Standard checklist in `CLAUDE.md`. Additionally: grep the codebase and confirm n
 
 **Extraction (Tier 1 only)**
 - Regex and gazetteers: phones, IMEIs, accounts, IFSC, registrations, dates, amounts
-- `mentions` written with `char_start`, `char_end`, `extraction_method`, `confidence`
+- `mentions` written with a `SourceLocator`, `extraction_method`, `confidence` — `text_span` for narrative text, `record_field` for tabular fields
 
 **Entities, edges, graph**
 - Entity creation **only** from exact identifier matches. Nothing about a person clusters automatically.
-- Edges from CDR (`called`) and transactions (`transferred_to`), `edge_origin = system_observed`
+- Edges, all `edge_origin = system_observed`: `called` from CDR, `transferred_to` from transactions, `mentioned_in` from regex extraction over FIR text
 - `edge_provenance` rows, mandatory, validated at write
 - `GraphProjection.build(case_id, scenario)` — **scenario parameter present now**, only `confirmed` implemented
 - Disk cache keyed by `(case_id, scenario, data_version)`, invalidated on write
@@ -212,13 +248,13 @@ Standard checklist in `CLAUDE.md`. Additionally: grep the codebase and confirm n
 - Focus mode at `/case/:id/graph`
 - **`EvidenceDrawer`** — one component, one contract, mounted at workspace level, driven by a Zustand store
 - Hover preview; click opens the drawer
-- Source document viewer with the exact span highlighted
+- Source viewer highlighting the exact span, row or field the locator names
 - IntersectionObserver lazy-mount wrapper
 
 ### Tests
 
 - Round-trip each source type: upload → records → mentions
-- Every mention's offsets slice back to its `surface_text` in the source
+- Every `text_span` mention's offsets slice back to its `surface_text` in the source; every `record_field` mention resolves to that field's value
 - An edge without provenance is rejected
 - Graph rebuild from an empty cache is deterministic
 - Two people with identical names do **not** become one entity; two mentions of one phone number **do**
@@ -249,7 +285,6 @@ Upload a CDR file and an FIR from a clean database and confirm the whole path wo
 - spaCy `en_core_web_md` over FIR narratives and surveillance notes
 - Gazetteer boost for Indian given names and surnames
 - Extraction benchmark against `holdout/` using `ground_truth.json`
-- Optional: GLiNER-small benchmarked against spaCy; adopt only if it wins on numbers
 - Name normalisation: honorifics (Shri, Thiru, S/o), initial expansion, name-order canonicalisation
 - Blocking: Double Metaphone of surname, district, shared exact identifier, first letter plus length
 - Scoring: rapidfuzz `token_set_ratio` and `partial_ratio`, exact identifier matches, contextual features, **contradicting features**
@@ -313,6 +348,7 @@ Upload a CDR file and an FIR from a clean database and confirm the whole path wo
 
 - Vertical timeline grouped by date; filters by person, phone, vehicle, account, event type, date range, source
 - Leaflet map with OSM tiles, incident pins, tower locations, clustering, layer toggles
+- Map tile decision resolved for offline operation (report §34) — decided here, when the map is built
 - Focus modes at `/case/:id/timeline` and `/case/:id/map`
 - Six deterministic pattern rules: burner handset continuity, co-presence without communication, circular fund flow, structuring, communication burst before an incident, newly formed connection
 - `base_rate_context` computed and stored for co-presence
@@ -414,10 +450,9 @@ Upload a CDR file and an FIR from a clean database and confirm the whole path wo
 ### Build
 
 - Performance pass: lazy mounting verified, graph capped, query indexes checked
-- `make reset` — one command back to a clean seeded state
+- Reset script — one command back to a clean seeded state
 - Pre-seeded database snapshot as a demo fallback
-- Offline verification: full flow with the network disconnected
-- Map tile decision resolved (report §34)
+- Offline verification: full flow with the network disconnected, including cached map tiles
 - Evaluation report: extraction and resolution precision and recall on holdout
 - Security pass: upload validation, error leakage, session handling, CORS, secrets audit
 - Demo script from report §44, timed; deck
