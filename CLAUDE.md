@@ -30,7 +30,9 @@ These are enforced in code, not documentation. A change that breaks any of them 
 
 1. **No silent identity merges.** No code path merges two person entities without an `identity_decisions` row naming a human. Merges are overlay records; underlying entities are never mutated or deleted.
 
-2. **Every edge carries provenance.** An edge without a supporting `edge_provenance` row fails validation. Every mention and every provenance row carries a `SourceLocator` — `text_span` (`char_start`, `char_end`), `record_field` or `record_row` — and never fabricated offsets on tabular data.
+2. **Provenance is required, in two parts.** These are separate guarantees; conflating them is what let §7 and §35 drift apart.
+   - **Every mention carries a `SourceLocator`** — `text_span` (`char_start`, `char_end`), `record_field` or `record_row`. Never fabricated offsets on tabular data.
+   - **Every edge carries at least one `edge_provenance` row with `role = "supporting"`.** An edge without one fails validation.
 
 3. **`edge_origin` is non-nullable** and one of `system_observed`, `system_inferred`, `investigator_asserted`. Serialisers may not omit it.
 
