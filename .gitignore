@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+web/dist/
+
+# Local environment
+.env
+
+# Generated synthetic data — regenerated from a fixed seed, never committed
+data/demo/
+data/holdout/
+
+# Uploaded evidence files
+uploads/
+
+# Databases
+*.db
+*.sqlite3

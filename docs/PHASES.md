@@ -159,6 +159,8 @@ Membership grant and revoke are **service-level functions** in Phase 0, used by 
 
 **Explicitly NOT in Phase 0:** login and registration screens, invitation flow and UI, revocation UI, team management screen, audit viewer. Those are Phase 5.
 
+**The worker loop is deferred to Phase 1, deliberately.** The `jobs` table ships in Phase 0 because it is part of the frozen schema, but a poll loop with nothing to poll does not. `avise/worker/` is created in Phase 1 alongside the first ingestion job. This is a deferral, not an omission.
+
 ## 0D — Synthetic data and ground truth
 
 - `tools/generate_data.py`, fixed seed

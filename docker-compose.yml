@@ -1,0 +1,21 @@
+# PostgreSQL only. The application runs on the host — see docs/AVISE-report.md §38.
+services:
+  db:
+    image: postgres:16
+    container_name: avise-db
+    environment:
+      POSTGRES_USER: avise
+      POSTGRES_PASSWORD: avise
+      POSTGRES_DB: avise
+    ports:
+      - "5432:5432"
+    volumes:
+      - avise-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U avise"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  avise-pgdata:
